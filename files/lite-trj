@@ -1,0 +1,204 @@
+#!/bin/bash
+LOCK_FILE="/etc/user_locks.db"
+XRAY_CONFIG="/etc/xray/config.json"
+BACKUP_DIR="/etc/xray/backups"
+domainku=$(cat /etc/xray/domain)
+ISP=$(cat /etc/xray/isp)
+
+LOCK_DURATION_SECONDS=3600                         
+FULL_LOG_FILE="/var/log/xray/access.log"
+FILTERED_LOG_FILE="/tmp/xray_filtered_temp.log"
+
+mkdir -p "$BACKUP_DIR"
+mkdir -p /etc/trojan/
+mkdir -p /etc/limit/trojan/ip/
+
+function con() {
+    local -i bytes=${1:-0}
+    if [[ $bytes -lt 1024 ]]; then echo "${bytes} B";
+    elif [[ $bytes -lt 1048576 ]]; then echo "$(( (bytes + 1023)/1024 )) KB";
+    elif [[ $bytes -lt 1073741824 ]]; then echo "$(( (bytes + 1048575)/1048576 )) MB";
+    else echo "$(( (bytes + 1073741823)/1073741824 )) GB"; fi
+}
+
+function send-ip() {
+    if [[ ! -f "/etc/bot/.bot.db" ]]; then return; fi # <-- FIXED
+    CHATID=$(grep -E "^#bot# " "/etc/bot/.bot.db" | cut -d ' ' -f 3)
+    KEY=$(grep -E "^#bot# " "/etc/bot/.bot.db" | cut -d ' ' -f 2)
+    URL="https://api.telegram.org/bot$KEY/sendMessage"
+    TEXT="
+<code>────────────────────</code>
+<b>⚠️ INGFO-INGFO MASEEE ⚠️</b>
+<code>────────────────────</code>
+<b>» ISP:</b> <code>${ISP}</code>
+<b>» Domain:</b> <code>${domainku}</code>
+<b>» Protocol:</b> <code>trojan</code>
+<b>» User:</b> <code>${user}</code>
+<b>» Limit IP:</b> <code>${limit_ip} HP</code>
+<b>» IP Login:</b> <code>${login_count} HP</code>
+<b>» Limit Quota:</b> <code>${limit_quota_ku}</code>
+<b>» Usage Quota:</b> <code>${usage_quota_ku}</code>
+<b>» Status:</b> <code>User telah dikunci</code>
+<b>» Durasi Penguncian 1 Jam</b>
+<code>────────────────────</code>
+<b>🤖 » User Nakal Sudah Di Kunci</b>
+<code>────────────────────</code>
+"
+    curl -s --max-time 10 -d "chat_id=$CHATID&disable_web_page_preview=1&text=$TEXT&parse_mode=html" $URL >/dev/null
+}
+
+function send-unban-notif() {
+    if [[ ! -f "/etc/bot/.bot.db" ]]; then return; fi # <-- FIXED
+    CHATID=$(grep -E "^#bot# " "/etc/bot/.bot.db" | cut -d ' ' -f 3)
+    KEY=$(grep -E "^#bot# " "/etc/bot/.bot.db" | cut -d ' ' -f 2)
+    URL="https://api.telegram.org/bot$KEY/sendMessage"
+    TEXT="
+<code>────────────────────</code>
+<b>✅ INGFO-INGFO MASEEE ✅</b>
+<code>────────────────────</code>
+<b>» ISP:</b> <code>${ISP}</code>
+<b>» Domain:</b> <code>${domainku}</code>
+<b>» Protocol:</b> <code>trojan</code>
+<b>» User:</b> <code>${unlocked_user}</code>
+<b>» Status:</b> <code>Telah Bebas Dari Penguncian</code>
+<code>────────────────────</code>
+<b>🤖 » User Di Bebaskan Dari Penguncian</b>
+<code>────────────────────</code>
+"
+    curl -s --max-time 10 -d "chat_id=$CHATID&disable_web_page_preview=1&text=$TEXT&parse_mode=html" $URL >/dev/null
+}
+
+reload_services() {
+    systemctl restart xray >/dev/null 2>&1
+}
+
+function modify_xray_config() {
+    local action="$1"
+    local user="$2"
+    local protocol="trojan"
+    local marker="#! $user"
+
+    if [[ $action == "lock" ]]; then
+        cp "$XRAY_CONFIG" "$BACKUP_DIR/config.json.bak"
+        sed -i "/^${marker}/,/^},{/d" "$XRAY_CONFIG"
+        echo -e "User '${user}' on protocol '${protocol}' has been locked."
+    elif [[ $action == "unlock" ]]; then
+        if [[ -f "$BACKUP_DIR/config.json.bak" ]]; then
+            cp "$BACKUP_DIR/config.json.bak" "$XRAY_CONFIG"
+            echo -e "User '${user}' on protocol '${protocol}' has been restored from the backup."
+        else
+            echo -e "Backup not found! Failed to unlock user '${user}'."
+        fi
+    fi
+}
+
+function lock_user() {
+    local user="$1"
+    if [[ -z "$user" ]]; then
+        echo -e "Username cannot be empty!"
+        return
+    fi
+
+    if grep -qw "trojan:${user}" "$LOCK_FILE"; then
+        echo -e "User '${user}' on trojan is already locked!"
+        return
+    fi # <-- FIXED
+
+    echo "trojan:${user}:$(date +%s)" >> "$LOCK_FILE"
+    modify_xray_config "lock" "$user"
+    reload_services
+}
+
+function unlock_expired_users() {
+    local current_time=$(date +%s)
+    local temp_lock_file=$(mktemp)
+    local unlocked_count=0
+
+    while IFS= read -r line; do
+        local protocol=$(echo "$line" | cut -d ':' -f 1)
+        local user=$(echo "$line" | cut -d ':' -f 2)
+        local lock_timestamp=$(echo "$line" | cut -d ':' -f 3)
+
+        if [[ "$protocol" == "trojan" && -n "$user" && -n "$lock_timestamp" ]]; then
+            local elapsed_time=$((current_time - lock_timestamp))
+
+            if [[ "$elapsed_time" -ge "$LOCK_DURATION_SECONDS" ]]; then
+                echo "Attempting to unlock trojan user: ${user} (locked for ${elapsed_time} seconds)"
+                modify_xray_config "unlock" "$user"
+                unlocked_user="$user"
+                send-unban-notif
+                unlocked_count=$((unlocked_count + 1))
+            else
+                echo "$line" >> "$temp_lock_file"
+            fi
+        else
+            echo "$line" >> "$temp_lock_file"
+        fi
+    done < "$LOCK_FILE"
+
+    mv "$temp_lock_file" "$LOCK_FILE"
+
+    if [[ "$unlocked_count" -gt 0 ]]; then
+        reload_services
+        echo "Unlocked ${unlocked_count} trojan user(s)."
+    fi
+}
+
+function memulai_pengecekan() {
+    clear
+    
+    unlock_expired_users
+
+    tail -n 100000 "$FULL_LOG_FILE" > "$FILTERED_LOG_FILE"
+
+    mapfile -t data < <(grep '#!' /etc/xray/config.json 2>/dev/null | awk '{print $2}' | sort -u)
+    
+    for user in "${data[@]}"; do
+        [[ -z "$user" ]] && continue
+
+        mapfile -t unique_local_ports < <(
+            grep "email: $user" "$FILTERED_LOG_FILE" \
+            | awk '{
+                source_col = ($4 ~ /127\.0\.0\.1:/) ? $4 : $3
+                
+                gsub("tcp:", "", source_col)
+                gsub("udp:", "", source_col)
+                
+                port_only = source_col
+                sub(/.*:/, "", port_only)
+                
+                print port_only
+            }' \
+            | sort -u
+        )
+
+        login_count=${#unique_local_ports[@]}
+
+        if [[ "$login_count" -gt 0 ]]; then
+            raw_limit_ip=$(cat /etc/limit/trojan/ip/"$user" 2>/dev/null || echo 0)
+            limit_ip=$(echo "$raw_limit_ip" | grep -o '[0-9]\+')
+            limit_quota_ku=$(con "$(cat "/etc/trojan/$user" 2>/dev/null || echo 0)")
+            usage_quota_ku=$(con "$(cat "/etc/limit/trojan/${user}" 2>/dev/null || echo 0)")
+
+            echo -e "User         : $user"
+            echo -e "Limit Login  : ${limit_ip} HP"
+            echo -e "User Login   : $login_count HP"
+            echo -e "Limit Quota  : ${limit_quota_ku}"
+            echo -e "Usage Quota  : ${usage_quota_ku}"
+
+            if [[ "$limit_ip" -eq 0 ]]; then
+                :
+            elif [[ "$login_count" -gt "$limit_ip" ]]; then
+                send-ip
+                lock_user "$user"
+                continue
+            fi
+        fi
+    done
+    
+    rm -f "$FILTERED_LOG_FILE"
+    echo -n > /var/log/xray/access.log 
+    sleep 2
+}
+
+memulai_pengecekan
